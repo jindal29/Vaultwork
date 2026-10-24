@@ -1,18 +1,32 @@
 -- ====================================================================
 -- VAULTWORK — COMPREHENSIVE PRODUCTION POSTGRESQL SCHEMA
--- Execute this script in your Supabase SQL Editor
+-- ====================================================================
+-- Deployment Target: Supabase PostgreSQL (SQL Editor or CLI)
+-- Idempotency: Safe for both fresh installations and existing databases.
+-- Preserves existing tables, constraints, and data (zero destructive drops).
+--
 -- Includes:
---   1. Core Tables, Constraints, and Indexes
---   2. Row-Level Security (RLS) Policies on Every Table
---   3. Triggers for Counts, Profiles, and Timestamps
---   4. Atomic RPC Workflow Functions (Developer Selection, Submissions, Reviews)
+--   1. Extensions & Custom Types
+--   2. Core Tables, Constraints, Foreign Keys & Checks
+--   3. Performance & GIN Indexes
+--   4. Triggers (Applications Count, Profiles Sync, Timestamps, Profile Guards)
+--   5. Granular Row Level Security (RLS) Policies with strict WITH CHECK
+--   6. Atomic SECURITY DEFINER Workflow Functions (Selection, Submissions, Reviews)
+--   7. Least-Privilege Function Permissions (REVOKE from PUBLIC, GRANT to authenticated)
 -- ====================================================================
 
+-- --------------------------------------------------------------------
+-- 1. EXTENSIONS
+-- --------------------------------------------------------------------
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- --------------------------------------------------------------------
--- 1. PROFILES TABLE
+-- 2. CORE TABLES & CONSTRAINTS
 -- --------------------------------------------------------------------
+
+-- A. PROFILES TABLE
+-- Directly mapped to Supabase auth.users(id)
 CREATE TABLE IF NOT EXISTS public.profiles (
   id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   username TEXT UNIQUE NOT NULL,
@@ -29,9 +43,8 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- --------------------------------------------------------------------
--- 2. BOUNTIES TABLE
--- --------------------------------------------------------------------
+-- B. BOUNTIES TABLE
+-- Main bounty marketplace entities
 CREATE TABLE IF NOT EXISTS public.bounties (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   creator_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
@@ -68,9 +81,8 @@ CREATE TABLE IF NOT EXISTS public.bounties (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- --------------------------------------------------------------------
--- 3. APPLICATIONS TABLE
--- --------------------------------------------------------------------
+-- C. APPLICATIONS TABLE
+-- Developer proposals for commissioned bounties
 CREATE TABLE IF NOT EXISTS public.applications (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   bounty_id UUID NOT NULL REFERENCES public.bounties(id) ON DELETE CASCADE,
@@ -91,9 +103,8 @@ CREATE TABLE IF NOT EXISTS public.applications (
   CONSTRAINT unique_applicant_per_bounty UNIQUE (bounty_id, developer_id)
 );
 
--- --------------------------------------------------------------------
--- 4. ASSIGNMENTS TABLE (Dedicated relation for active assignment)
--- --------------------------------------------------------------------
+-- D. ASSIGNMENTS TABLE
+-- Explicit 1-to-1 active engagement record per bounty
 CREATE TABLE IF NOT EXISTS public.assignments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   bounty_id UUID NOT NULL REFERENCES public.bounties(id) ON DELETE CASCADE,
@@ -105,9 +116,8 @@ CREATE TABLE IF NOT EXISTS public.assignments (
   CONSTRAINT unique_active_assignment_per_bounty UNIQUE (bounty_id)
 );
 
--- --------------------------------------------------------------------
--- 5. SUBMISSIONS TABLE (Workroom iterations & deliverables)
--- --------------------------------------------------------------------
+-- E. SUBMISSIONS TABLE
+-- Milestone deliverables and revision rounds
 CREATE TABLE IF NOT EXISTS public.submissions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   bounty_id UUID NOT NULL REFERENCES public.bounties(id) ON DELETE CASCADE,
@@ -125,9 +135,8 @@ CREATE TABLE IF NOT EXISTS public.submissions (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- --------------------------------------------------------------------
--- 6. NOTIFICATIONS TABLE
--- --------------------------------------------------------------------
+-- F. NOTIFICATIONS TABLE
+-- Real-time user workflow alerts
 CREATE TABLE IF NOT EXISTS public.notifications (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
@@ -146,9 +155,8 @@ CREATE TABLE IF NOT EXISTS public.notifications (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- --------------------------------------------------------------------
--- 7. ACTIVITY_EVENTS TABLE (Audit log of all workflow actions)
--- --------------------------------------------------------------------
+-- G. ACTIVITY_EVENTS TABLE
+-- Immutable audit log for transparency
 CREATE TABLE IF NOT EXISTS public.activity_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   bounty_id UUID NOT NULL REFERENCES public.bounties(id) ON DELETE CASCADE,
@@ -168,7 +176,7 @@ CREATE TABLE IF NOT EXISTS public.activity_events (
 );
 
 -- --------------------------------------------------------------------
--- 8. PERFORMANCE INDEXES
+-- 3. PERFORMANCE & DISCOVERY INDEXES
 -- --------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_bounties_creator ON public.bounties(creator_id);
 CREATE INDEX IF NOT EXISTS idx_bounties_status ON public.bounties(status);
@@ -186,21 +194,37 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON public.notifications(u
 CREATE INDEX IF NOT EXISTS idx_activity_events_bounty ON public.activity_events(bounty_id, created_at DESC);
 
 -- --------------------------------------------------------------------
--- 9. TRIGGERS & GUARD FUNCTIONS
+-- 4. TRIGGERS & GUARD FUNCTIONS
 -- --------------------------------------------------------------------
 
--- A. Applications Count Trigger
+-- A. Applications Count Auto-Sync (Handles INSERT, DELETE, and UPDATE of status)
 CREATE OR REPLACE FUNCTION public.handle_bounty_applications_count()
 RETURNS TRIGGER AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    UPDATE public.bounties
-    SET applications_count = applications_count + 1
-    WHERE id = NEW.bounty_id;
+    IF NEW.status != 'withdrawn' THEN
+      UPDATE public.bounties
+      SET applications_count = applications_count + 1
+      WHERE id = NEW.bounty_id;
+    END IF;
   ELSIF TG_OP = 'DELETE' THEN
-    UPDATE public.bounties
-    SET applications_count = GREATEST(0, applications_count - 1)
-    WHERE id = OLD.bounty_id;
+    IF OLD.status != 'withdrawn' THEN
+      UPDATE public.bounties
+      SET applications_count = GREATEST(0, applications_count - 1)
+      WHERE id = OLD.bounty_id;
+    END IF;
+  ELSIF TG_OP = 'UPDATE' THEN
+    -- Transitioning to withdrawn -> decrement
+    IF OLD.status != 'withdrawn' AND NEW.status = 'withdrawn' THEN
+      UPDATE public.bounties
+      SET applications_count = GREATEST(0, applications_count - 1)
+      WHERE id = NEW.bounty_id;
+    -- Transitioning from withdrawn back to active -> increment
+    ELSIF OLD.status = 'withdrawn' AND NEW.status != 'withdrawn' THEN
+      UPDATE public.bounties
+      SET applications_count = applications_count + 1
+      WHERE id = NEW.bounty_id;
+    END IF;
   END IF;
   RETURN NULL;
 END;
@@ -208,10 +232,10 @@ $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 DROP TRIGGER IF EXISTS on_application_change ON public.applications;
 CREATE TRIGGER on_application_change
-  AFTER INSERT OR DELETE ON public.applications
+  AFTER INSERT OR UPDATE OR DELETE ON public.applications
   FOR EACH ROW EXECUTE FUNCTION public.handle_bounty_applications_count();
 
--- B. Auto-create Profile on Auth Signup
+-- B. Auto-create Profile upon Supabase Auth Signup
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -285,8 +309,10 @@ CREATE TRIGGER trg_guard_profile_fields
   FOR EACH ROW EXECUTE FUNCTION public.guard_profile_protected_fields();
 
 -- --------------------------------------------------------------------
--- 10. ROW LEVEL SECURITY (RLS) POLICIES
+-- 5. ROW LEVEL SECURITY (RLS) POLICIES
 -- --------------------------------------------------------------------
+-- Idempotent RLS: drop and recreate to guarantee zero policy conflict errors
+
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.bounties ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.applications ENABLE ROW LEVEL SECURITY;
@@ -295,91 +321,163 @@ ALTER TABLE public.submissions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.activity_events ENABLE ROW LEVEL SECURITY;
 
--- Profiles: Anyone can view profiles, owners can update their own
+-- A. PROFILES
+DROP POLICY IF EXISTS "Public profiles are viewable by everyone" ON public.profiles;
 CREATE POLICY "Public profiles are viewable by everyone" 
-  ON public.profiles FOR SELECT USING (true);
+  ON public.profiles FOR SELECT 
+  USING (true);
 
+DROP POLICY IF EXISTS "Users can update their own profile" ON public.profiles;
 CREATE POLICY "Users can update their own profile" 
-  ON public.profiles FOR UPDATE TO authenticated USING (auth.uid() = id);
+  ON public.profiles FOR UPDATE 
+  TO authenticated 
+  USING (auth.uid() = id)
+  WITH CHECK (auth.uid() = id);
 
--- Bounties: Viewable if not draft or creator; insertable by creator; updatable by creator
+-- B. BOUNTIES
+DROP POLICY IF EXISTS "Published bounties are viewable by everyone" ON public.bounties;
 CREATE POLICY "Published bounties are viewable by everyone" 
-  ON public.bounties FOR SELECT USING (status != 'draft' OR auth.uid() = creator_id);
+  ON public.bounties FOR SELECT 
+  USING (status != 'draft' OR auth.uid() = creator_id);
 
+DROP POLICY IF EXISTS "Authenticated users can create bounties" ON public.bounties;
 CREATE POLICY "Authenticated users can create bounties" 
-  ON public.bounties FOR INSERT TO authenticated WITH CHECK (auth.uid() = creator_id);
+  ON public.bounties FOR INSERT 
+  TO authenticated 
+  WITH CHECK (auth.uid() = creator_id);
 
+DROP POLICY IF EXISTS "Creators can update their own bounties" ON public.bounties;
 CREATE POLICY "Creators can update their own bounties" 
-  ON public.bounties FOR UPDATE TO authenticated USING (auth.uid() = creator_id);
+  ON public.bounties FOR UPDATE 
+  TO authenticated 
+  USING (auth.uid() = creator_id)
+  WITH CHECK (auth.uid() = creator_id);
 
--- Applications: Bounty creators can view all applications to their bounty; developers view their own
+-- C. APPLICATIONS
+DROP POLICY IF EXISTS "Applicants and creators can view applications" ON public.applications;
 CREATE POLICY "Applicants and creators can view applications" 
-  ON public.applications FOR SELECT TO authenticated
+  ON public.applications FOR SELECT 
+  TO authenticated
   USING (
     auth.uid() = developer_id OR EXISTS (
       SELECT 1 FROM public.bounties WHERE id = applications.bounty_id AND creator_id = auth.uid()
     )
   );
 
+DROP POLICY IF EXISTS "Developers can apply to open bounties" ON public.applications;
 CREATE POLICY "Developers can apply to open bounties" 
-  ON public.applications FOR INSERT TO authenticated
+  ON public.applications FOR INSERT 
+  TO authenticated
   WITH CHECK (
     auth.uid() = developer_id AND
     EXISTS (
       SELECT 1 FROM public.bounties
-      WHERE id = bounty_id AND status = 'open' AND deadline > NOW() AND creator_id != auth.uid()
+      WHERE id = bounty_id 
+        AND status = 'open' 
+        AND deadline > NOW() 
+        AND creator_id != auth.uid()
     )
   );
 
+-- Developers can withdraw their own proposals (status can only transition to withdrawn)
+DROP POLICY IF EXISTS "Applicants can withdraw their own proposals" ON public.applications;
 CREATE POLICY "Applicants can withdraw their own proposals" 
-  ON public.applications FOR UPDATE TO authenticated
+  ON public.applications FOR UPDATE 
+  TO authenticated
+  USING (auth.uid() = developer_id)
+  WITH CHECK (auth.uid() = developer_id AND status = 'withdrawn');
+
+-- Bounty creators can manage applicant statuses
+DROP POLICY IF EXISTS "Creators can update applications on their bounties" ON public.applications;
+CREATE POLICY "Creators can update applications on their bounties" 
+  ON public.applications FOR UPDATE 
+  TO authenticated
   USING (
-    auth.uid() = developer_id OR 
-    EXISTS (SELECT 1 FROM public.bounties WHERE id = applications.bounty_id AND creator_id = auth.uid())
+    EXISTS (
+      SELECT 1 FROM public.bounties 
+      WHERE id = applications.bounty_id AND creator_id = auth.uid()
+    )
+  )
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.bounties 
+      WHERE id = applications.bounty_id AND creator_id = auth.uid()
+    )
   );
 
--- Assignments: Viewable by creator and assigned developer
+-- D. ASSIGNMENTS
+-- Only visible to the creator and the assigned developer.
+-- Mutation is strictly restricted to SECURITY DEFINER RPCs (no direct client INSERT/UPDATE).
+DROP POLICY IF EXISTS "Involved participants can view assignment" ON public.assignments;
 CREATE POLICY "Involved participants can view assignment" 
-  ON public.assignments FOR SELECT TO authenticated
+  ON public.assignments FOR SELECT 
+  TO authenticated
   USING (
     auth.uid() = developer_id OR EXISTS (
       SELECT 1 FROM public.bounties WHERE id = assignments.bounty_id AND creator_id = auth.uid()
     )
   );
 
--- Submissions: Creator and assigned developer can view and manage
+-- E. SUBMISSIONS
+DROP POLICY IF EXISTS "View submissions for involved parties" ON public.submissions;
 CREATE POLICY "View submissions for involved parties" 
-  ON public.submissions FOR SELECT TO authenticated
+  ON public.submissions FOR SELECT 
+  TO authenticated
   USING (
     auth.uid() = developer_id OR EXISTS (
       SELECT 1 FROM public.bounties WHERE id = submissions.bounty_id AND creator_id = auth.uid()
     )
   );
 
+DROP POLICY IF EXISTS "Assigned developer can submit deliverables" ON public.submissions;
 CREATE POLICY "Assigned developer can submit deliverables" 
-  ON public.submissions FOR INSERT TO authenticated
+  ON public.submissions FOR INSERT 
+  TO authenticated
   WITH CHECK (
     auth.uid() = developer_id AND EXISTS (
-      SELECT 1 FROM public.bounties WHERE id = submissions.bounty_id AND assigned_developer_id = auth.uid()
+      SELECT 1 FROM public.bounties 
+      WHERE id = submissions.bounty_id 
+        AND assigned_developer_id = auth.uid() 
+        AND status = 'in_progress'
     )
   );
 
+DROP POLICY IF EXISTS "Creator can review deliverables" ON public.submissions;
 CREATE POLICY "Creator can review deliverables" 
-  ON public.submissions FOR UPDATE TO authenticated
+  ON public.submissions FOR UPDATE 
+  TO authenticated
   USING (
-    EXISTS (SELECT 1 FROM public.bounties WHERE id = submissions.bounty_id AND creator_id = auth.uid())
+    EXISTS (
+      SELECT 1 FROM public.bounties 
+      WHERE id = submissions.bounty_id AND creator_id = auth.uid()
+    )
+  )
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.bounties 
+      WHERE id = submissions.bounty_id AND creator_id = auth.uid()
+    )
   );
 
--- Notifications: Users only see their own notifications
+-- F. NOTIFICATIONS
+DROP POLICY IF EXISTS "Users can view own notifications" ON public.notifications;
 CREATE POLICY "Users can view own notifications" 
-  ON public.notifications FOR SELECT TO authenticated USING (auth.uid() = user_id);
+  ON public.notifications FOR SELECT 
+  TO authenticated 
+  USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS "Users can mark own notifications as read" ON public.notifications;
 CREATE POLICY "Users can mark own notifications as read" 
-  ON public.notifications FOR UPDATE TO authenticated USING (auth.uid() = user_id);
+  ON public.notifications FOR UPDATE 
+  TO authenticated 
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 
--- Activity Events: Viewable by participants
+-- G. ACTIVITY EVENTS
+DROP POLICY IF EXISTS "Participants can view activity" ON public.activity_events;
 CREATE POLICY "Participants can view activity" 
-  ON public.activity_events FOR SELECT TO authenticated
+  ON public.activity_events FOR SELECT 
+  TO authenticated
   USING (
     EXISTS (
       SELECT 1 FROM public.bounties
@@ -392,10 +490,11 @@ CREATE POLICY "Participants can view activity"
   );
 
 -- --------------------------------------------------------------------
--- 11. ATOMIC WORKFLOW RPC FUNCTIONS
+-- 6. ATOMIC WORKFLOW RPC FUNCTIONS
 -- --------------------------------------------------------------------
 
 -- A. Select Developer & Assign to Bounty
+-- Concurrency safe with row locks (FOR UPDATE)
 CREATE OR REPLACE FUNCTION public.select_bounty_developer(
   p_bounty_id UUID,
   p_application_id UUID
@@ -414,7 +513,7 @@ BEGIN
     RAISE EXCEPTION 'Authentication required.';
   END IF;
 
-  -- Lock bounty row for update
+  -- 1. Lock bounty row for update to eliminate race conditions
   SELECT * INTO v_bounty
   FROM public.bounties
   WHERE id = p_bounty_id
@@ -432,7 +531,7 @@ BEGIN
     RAISE EXCEPTION 'Bounty is not open for selection (status: %)', v_bounty.status;
   END IF;
 
-  -- Lock application
+  -- 2. Lock and verify application
   SELECT * INTO v_application
   FROM public.applications
   WHERE id = p_application_id AND bounty_id = p_bounty_id
@@ -443,20 +542,20 @@ BEGIN
   END IF;
 
   IF v_application.status != 'pending' THEN
-    RAISE EXCEPTION 'Application is not in pending status.';
+    RAISE EXCEPTION 'Application is not in pending status (status: %)', v_application.status;
   END IF;
 
-  -- Accept application
+  -- 3. Accept application
   UPDATE public.applications
   SET status = 'accepted', updated_at = NOW()
   WHERE id = p_application_id;
 
-  -- Reject other pending applications
+  -- 4. Reject other pending applications for this bounty
   UPDATE public.applications
   SET status = 'rejected', updated_at = NOW()
   WHERE bounty_id = p_bounty_id AND id != p_application_id AND status = 'pending';
 
-  -- Upsert assignment record
+  -- 5. Upsert active assignment record
   INSERT INTO public.assignments (
     bounty_id,
     developer_id,
@@ -474,14 +573,14 @@ BEGIN
       status = 'active',
       assigned_at = NOW();
 
-  -- Update bounty status to in_progress
+  -- 6. Transition bounty status to in_progress
   UPDATE public.bounties
   SET assigned_developer_id = v_application.developer_id,
       status = 'in_progress',
       updated_at = NOW()
   WHERE id = p_bounty_id;
 
-  -- Record audit event
+  -- 7. Record audit activity
   INSERT INTO public.activity_events (
     bounty_id,
     actor_id,
@@ -498,7 +597,7 @@ BEGIN
     )
   );
 
-  -- Notify developer
+  -- 8. Notify the selected developer
   INSERT INTO public.notifications (
     user_id,
     title,
@@ -522,7 +621,7 @@ BEGIN
 END;
 $$;
 
--- B. Submit Deliverables
+-- B. Submit Deliverables to Workroom
 CREATE OR REPLACE FUNCTION public.submit_bounty_deliverable(
   p_bounty_id UUID,
   p_notes TEXT,
@@ -577,6 +676,7 @@ BEGIN
   )
   RETURNING id INTO v_submission_id;
 
+  -- Transition bounty status to in_review
   UPDATE public.bounties
   SET status = 'in_review', updated_at = NOW()
   WHERE id = p_bounty_id;
@@ -620,7 +720,8 @@ BEGIN
 END;
 $$;
 
--- C. Review Submission (Approve or Request Revision)
+-- C. Review Submission (Approve Milestone or Request Revisions)
+-- Accurate, honest wording: marks milestone completed without false claims of on-chain escrow
 CREATE OR REPLACE FUNCTION public.review_bounty_submission(
   p_submission_id UUID,
   p_bounty_id UUID,
@@ -673,14 +774,17 @@ BEGIN
   WHERE id = p_submission_id;
 
   IF p_status = 'approved' THEN
+    -- Transition bounty to completed
     UPDATE public.bounties
     SET status = 'completed', updated_at = NOW()
     WHERE id = p_bounty_id;
 
+    -- Mark assignment completed
     UPDATE public.assignments
     SET status = 'completed', completed_at = NOW()
     WHERE bounty_id = p_bounty_id;
 
+    -- USD conversion for profile metrics
     v_usd_amount := CASE 
       WHEN v_bounty.reward_currency IN ('USDC', 'USDT') THEN v_bounty.reward_amount
       WHEN v_bounty.reward_currency = 'ETH' THEN v_bounty.reward_amount * 3200
@@ -688,6 +792,7 @@ BEGIN
       ELSE v_bounty.reward_amount
     END;
 
+    -- Elevate privileges for trigger bypass
     PERFORM set_config('vaultwork.internal_system_operation', 'true', true);
 
     UPDATE public.profiles
@@ -705,9 +810,13 @@ BEGIN
       p_bounty_id,
       v_creator_id,
       'work_approved',
-      jsonb_build_object('submission_id', p_submission_id)
+      jsonb_build_object(
+        'submission_id', p_submission_id,
+        'milestone_status', 'completed_and_reward_credited'
+      )
     );
 
+    -- Honest notification without false claims of on-chain escrow
     INSERT INTO public.notifications (
       user_id,
       title,
@@ -717,13 +826,14 @@ BEGIN
     )
     VALUES (
       v_submission.developer_id,
-      'Work Approved & Escrow Released! 💰',
-      format('Your deliverables for "%s" have been approved! %s %s has been released.', v_bounty.title, v_bounty.reward_amount, v_bounty.reward_currency),
+      'Deliverables Approved! 🏆',
+      format('Your deliverables for "%s" have been approved! %s %s has been credited to your milestone earnings.', v_bounty.title, v_bounty.reward_amount, v_bounty.reward_currency),
       'bounty_completed',
       format('/work/%s', p_bounty_id)
     );
 
   ELSIF p_status = 'revision_requested' THEN
+    -- Return bounty to in_progress
     UPDATE public.bounties
     SET status = 'in_progress', updated_at = NOW()
     WHERE id = p_bounty_id;
@@ -770,6 +880,7 @@ END;
 $$;
 
 -- D. Withdraw Application
+-- Note: Trigger on_application_change handles applications_count decrement automatically
 CREATE OR REPLACE FUNCTION public.withdraw_bounty_application(
   p_application_id UUID
 )
@@ -802,13 +913,10 @@ BEGIN
     RAISE EXCEPTION 'Only pending applications can be withdrawn.';
   END IF;
 
+  -- Updating status to 'withdrawn' automatically invokes on_application_change trigger
   UPDATE public.applications
   SET status = 'withdrawn', updated_at = NOW()
   WHERE id = p_application_id;
-
-  UPDATE public.bounties
-  SET applications_count = GREATEST(0, applications_count - 1)
-  WHERE id = v_application.bounty_id;
 
   INSERT INTO public.activity_events (
     bounty_id,
@@ -829,3 +937,49 @@ BEGIN
   );
 END;
 $$;
+
+-- E. Fetch Bounty Audit Activity
+CREATE OR REPLACE FUNCTION public.get_bounty_activity(p_bounty_id UUID)
+RETURNS TABLE (
+  id UUID,
+  event_type TEXT,
+  actor_name TEXT,
+  actor_username TEXT,
+  details JSONB,
+  created_at TIMESTAMPTZ
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+  SELECT 
+    ae.id,
+    ae.event_type,
+    p.display_name AS actor_name,
+    p.username AS actor_username,
+    ae.details,
+    ae.created_at
+  FROM public.activity_events ae
+  JOIN public.profiles p ON p.id = ae.actor_id
+  WHERE ae.bounty_id = p_bounty_id
+  ORDER BY ae.created_at DESC;
+$$;
+
+-- --------------------------------------------------------------------
+-- 7. FUNCTION PERMISSIONS (LEAST PRIVILEGE)
+-- --------------------------------------------------------------------
+REVOKE EXECUTE ON FUNCTION public.select_bounty_developer(UUID, UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.select_bounty_developer(UUID, UUID) TO authenticated;
+
+REVOKE EXECUTE ON FUNCTION public.submit_bounty_deliverable(UUID, TEXT, TEXT[], TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.submit_bounty_deliverable(UUID, TEXT, TEXT[], TEXT) TO authenticated;
+
+REVOKE EXECUTE ON FUNCTION public.review_bounty_submission(UUID, UUID, TEXT, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.review_bounty_submission(UUID, UUID, TEXT, TEXT) TO authenticated;
+
+REVOKE EXECUTE ON FUNCTION public.withdraw_bounty_application(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.withdraw_bounty_application(UUID) TO authenticated;
+
+REVOKE EXECUTE ON FUNCTION public.get_bounty_activity(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_bounty_activity(UUID) TO authenticated, anon;

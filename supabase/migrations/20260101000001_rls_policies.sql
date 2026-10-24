@@ -90,14 +90,31 @@ CREATE POLICY "Developers can apply to open bounties"
     )
   );
 
+-- Applicants can withdraw their own proposals (status can only transition to withdrawn)
 DROP POLICY IF EXISTS "Applicants can withdraw their own proposals" ON public.applications;
 CREATE POLICY "Applicants can withdraw their own proposals"
   ON public.applications FOR UPDATE
   TO authenticated
-  USING (auth.uid() = developer_id OR EXISTS (
-    SELECT 1 FROM public.bounties 
-    WHERE id = applications.bounty_id AND creator_id = auth.uid()
-  ));
+  USING (auth.uid() = developer_id)
+  WITH CHECK (auth.uid() = developer_id AND status = 'withdrawn');
+
+-- Bounty creators can manage applicant statuses
+DROP POLICY IF EXISTS "Creators can update applications on their bounties" ON public.applications;
+CREATE POLICY "Creators can update applications on their bounties"
+  ON public.applications FOR UPDATE
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.bounties 
+      WHERE id = applications.bounty_id AND creator_id = auth.uid()
+    )
+  )
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.bounties 
+      WHERE id = applications.bounty_id AND creator_id = auth.uid()
+    )
+  );
 
 -- 6. ASSIGNMENTS POLICIES
 DROP POLICY IF EXISTS "Involved participants can view assignment" ON public.assignments;

@@ -170,13 +170,27 @@ CREATE OR REPLACE FUNCTION public.handle_bounty_applications_count()
 RETURNS TRIGGER AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    UPDATE public.bounties
-    SET applications_count = applications_count + 1
-    WHERE id = NEW.bounty_id;
+    IF NEW.status != 'withdrawn' THEN
+      UPDATE public.bounties
+      SET applications_count = applications_count + 1
+      WHERE id = NEW.bounty_id;
+    END IF;
   ELSIF TG_OP = 'DELETE' THEN
-    UPDATE public.bounties
-    SET applications_count = GREATEST(0, applications_count - 1)
-    WHERE id = OLD.bounty_id;
+    IF OLD.status != 'withdrawn' THEN
+      UPDATE public.bounties
+      SET applications_count = GREATEST(0, applications_count - 1)
+      WHERE id = OLD.bounty_id;
+    END IF;
+  ELSIF TG_OP = 'UPDATE' THEN
+    IF OLD.status != 'withdrawn' AND NEW.status = 'withdrawn' THEN
+      UPDATE public.bounties
+      SET applications_count = GREATEST(0, applications_count - 1)
+      WHERE id = NEW.bounty_id;
+    ELSIF OLD.status = 'withdrawn' AND NEW.status != 'withdrawn' THEN
+      UPDATE public.bounties
+      SET applications_count = applications_count + 1
+      WHERE id = NEW.bounty_id;
+    END IF;
   END IF;
   RETURN NULL;
 END;
@@ -184,7 +198,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 DROP TRIGGER IF EXISTS on_application_change ON public.applications;
 CREATE TRIGGER on_application_change
-  AFTER INSERT OR DELETE ON public.applications
+  AFTER INSERT OR UPDATE OR DELETE ON public.applications
   FOR EACH ROW EXECUTE FUNCTION public.handle_bounty_applications_count();
 
 -- B. Auto-create profile on new user signup

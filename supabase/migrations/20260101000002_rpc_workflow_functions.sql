@@ -335,8 +335,8 @@ BEGIN
     )
     VALUES (
       v_submission.developer_id,
-      'Work Approved & Escrow Released! 💰',
-      format('Your deliverables for "%s" have been approved! %s %s has been released.', v_bounty.title, v_bounty.reward_amount, v_bounty.reward_currency),
+      'Deliverables Approved! 🏆',
+      format('Your deliverables for "%s" have been approved! %s %s has been credited to your milestone earnings.', v_bounty.title, v_bounty.reward_amount, v_bounty.reward_currency),
       'bounty_completed',
       format('/work/%s', p_bounty_id)
     );
@@ -423,14 +423,10 @@ BEGIN
     RAISE EXCEPTION 'Only pending applications can be withdrawn.';
   END IF;
 
+  -- Status update automatically fires on_application_change trigger
   UPDATE public.applications
   SET status = 'withdrawn', updated_at = NOW()
   WHERE id = p_application_id;
-
-  -- Decrement applications count
-  UPDATE public.bounties
-  SET applications_count = GREATEST(0, applications_count - 1)
-  WHERE id = v_application.bounty_id;
 
   -- Record activity
   INSERT INTO public.activity_events (
@@ -480,3 +476,19 @@ AS $$
   WHERE ae.bounty_id = p_bounty_id
   ORDER BY ae.created_at DESC;
 $$;
+
+-- LEAST PRIVILEGE PERMISSIONS
+REVOKE EXECUTE ON FUNCTION public.select_bounty_developer(UUID, UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.select_bounty_developer(UUID, UUID) TO authenticated;
+
+REVOKE EXECUTE ON FUNCTION public.submit_bounty_deliverable(UUID, TEXT, TEXT[], TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.submit_bounty_deliverable(UUID, TEXT, TEXT[], TEXT) TO authenticated;
+
+REVOKE EXECUTE ON FUNCTION public.review_bounty_submission(UUID, UUID, TEXT, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.review_bounty_submission(UUID, UUID, TEXT, TEXT) TO authenticated;
+
+REVOKE EXECUTE ON FUNCTION public.withdraw_bounty_application(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.withdraw_bounty_application(UUID) TO authenticated;
+
+REVOKE EXECUTE ON FUNCTION public.get_bounty_activity(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_bounty_activity(UUID) TO authenticated, anon;
