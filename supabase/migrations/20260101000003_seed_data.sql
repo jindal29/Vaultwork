@@ -2,7 +2,32 @@
 -- MIGRATION 000003: SEED DATA FIXTURES
 -- ====================================================================
 
--- Insert sample profiles (matching UUIDs if created in auth or standalone demo)
+-- Allow initial metrics seeding past trigger guard
+SET vaultwork.internal_system_operation = 'true';
+
+-- 1. Insert seed auth.users records so foreign key references to auth.users succeed
+INSERT INTO auth.users (
+  id,
+  instance_id,
+  aud,
+  role,
+  email,
+  encrypted_password,
+  email_confirmed_at,
+  raw_app_meta_data,
+  raw_user_meta_data,
+  created_at,
+  updated_at
+)
+VALUES
+  ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'satoshi@vaultwork.xyz', '$2a$10$w8T0J4yH.K8/9mJqJq9F0O1E7B2s6a4Y9F0O1E7B2s6a4Y9F0O1E7', NOW(), '{"provider":"email","providers":["email"]}', '{"username":"satoshi_builder","display_name":"Satoshi Builder"}', NOW(), NOW()),
+  ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'uniswap@vaultwork.xyz', '$2a$10$w8T0J4yH.K8/9mJqJq9F0O1E7B2s6a4Y9F0O1E7B2s6a4Y9F0O1E7', NOW(), '{"provider":"email","providers":["email"]}', '{"username":"uniswap_labs","display_name":"Uniswap Ecosystem Guild"}', NOW(), NOW()),
+  ('00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'aave@vaultwork.xyz', '$2a$10$w8T0J4yH.K8/9mJqJq9F0O1E7B2s6a4Y9F0O1E7B2s6a4Y9F0O1E7', NOW(), '{"provider":"email","providers":["email"]}', '{"username":"aave_grants","display_name":"Aave Grants DAO"}', NOW(), NOW()),
+  ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'alex@vaultwork.xyz', '$2a$10$w8T0J4yH.K8/9mJqJq9F0O1E7B2s6a4Y9F0O1E7B2s6a4Y9F0O1E7', NOW(), '{"provider":"email","providers":["email"]}', '{"username":"alex_sol","display_name":"Alex Vance"}', NOW(), NOW()),
+  ('00000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'elena@vaultwork.xyz', '$2a$10$w8T0J4yH.K8/9mJqJq9F0O1E7B2s6a4Y9F0O1E7B2s6a4Y9F0O1E7', NOW(), '{"provider":"email","providers":["email"]}', '{"username":"elena_chain","display_name":"Elena Rostova"}', NOW(), NOW())
+ON CONFLICT (id) DO NOTHING;
+
+-- 2. Insert or update sample profiles
 INSERT INTO public.profiles (
   id,
   username,
@@ -82,7 +107,20 @@ VALUES
     11,
     38200
   )
-ON CONFLICT (id) DO NOTHING;
+ON CONFLICT (id) DO UPDATE
+SET username = EXCLUDED.username,
+    display_name = EXCLUDED.display_name,
+    avatar_url = EXCLUDED.avatar_url,
+    bio = EXCLUDED.bio,
+    skills = EXCLUDED.skills,
+    github_url = EXCLUDED.github_url,
+    portfolio_url = EXCLUDED.portfolio_url,
+    wallet_address = EXCLUDED.wallet_address,
+    bounties_completed = EXCLUDED.bounties_completed,
+    total_earned_usd = EXCLUDED.total_earned_usd;
+
+-- Reset internal system operation flag
+SET vaultwork.internal_system_operation = 'false';
 
 -- Insert sample bounties
 INSERT INTO public.bounties (
