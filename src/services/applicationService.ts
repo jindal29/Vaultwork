@@ -14,8 +14,11 @@ export const applicationService = {
         `)
         .eq('bounty_id', bountyId)
         .order('created_at', { ascending: false })
-      if (error) return []
-      return data as Application[]
+      if (error) {
+        console.error('Error fetching bounty applications:', error)
+        return []
+      }
+      return (data || []) as Application[]
     }
     return LocalStore.getApplications(bountyId)
   },
@@ -33,8 +36,11 @@ export const applicationService = {
         `)
         .eq('developer_id', developerId)
         .order('created_at', { ascending: false })
-      if (error) return []
-      return data as Application[]
+      if (error) {
+        console.error('Error fetching developer applications:', error)
+        return []
+      }
+      return (data || []) as Application[]
     }
     return LocalStore.getDeveloperApplications(developerId)
   },
@@ -66,6 +72,20 @@ export const applicationService = {
 
   async updateApplicationStatus(applicationId: string, status: ApplicationStatus): Promise<{ data: Application | null; error: Error | null }> {
     if (isSupabaseConfigured) {
+      if (status === 'withdrawn') {
+        const { error: rpcError } = await supabase.rpc('withdraw_bounty_application', {
+          p_application_id: applicationId
+        })
+        if (!rpcError) {
+          const { data } = await supabase
+            .from('applications')
+            .select('*, developer:profiles!developer_id(*)')
+            .eq('id', applicationId)
+            .single()
+          return { data: data as Application, error: null }
+        }
+      }
+
       const { data, error } = await supabase
         .from('applications')
         .update({
@@ -88,13 +108,30 @@ export const applicationService = {
   },
 
   async acceptApplicantAndAssign(bountyId: string, applicationId: string, developerId: string): Promise<{ success: boolean; error?: Error }> {
+    if (isSupabaseConfigured) {
+      // 1. Invoke atomic PostgreSQL RPC transaction with FOR UPDATE row locking
+      const { data, error } = await supabase.rpc('select_bounty_developer', {
+        p_bounty_id: bountyId,
+        p_application_id: applicationId
+      })
+
+      if (error) {
+        console.warn('RPC select_bounty_developer error, attempting direct transaction fallback:', error)
+        // Fallback for manual or client transactions
+        try {
+          await this.updateApplicationStatus(applicationId, 'accepted')
+          await bountyService.updateBountyStatus(bountyId, 'in_progress', developerId)
+          return { success: true }
+        } catch (fallbackErr) {
+          return { success: false, error: new Error(error.message) }
+        }
+      }
+
+      return { success: true }
+    }
+
     try {
-      // 1. Accept this application
-      await this.updateApplicationStatus(applicationId, 'accepted')
-
-      // 2. Assign developer to bounty and update status to in_progress
-      await bountyService.updateBountyStatus(bountyId, 'in_progress', developerId)
-
+      LocalStore.selectDeveloper(bountyId, applicationId, developerId)
       return { success: true }
     } catch (err) {
       return { success: false, error: err as Error }

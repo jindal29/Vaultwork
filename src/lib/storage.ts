@@ -115,7 +115,7 @@ export class LocalStore {
 
     const newBounty: Bounty = {
       ...bountyData,
-      id: 'bounty-' + Date.now(),
+      id: 'bounty-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
       created_at: new Date().toISOString(),
       applications_count: 0,
       creator,
@@ -173,6 +173,23 @@ export class LocalStore {
     const developer = profiles[appData.developer_id] || this.getCurrentUser() || DEMO_USER
     const bounty = this.getBounty(appData.bounty_id)
 
+    if (bounty) {
+      // Validate self-application
+      if (bounty.creator_id === appData.developer_id) {
+        throw new Error('Creators cannot apply to their own bounties.')
+      }
+
+      // Validate status
+      if (bounty.status !== 'open') {
+        throw new Error('Applications can only be submitted to open bounties.')
+      }
+
+      // Validate deadline
+      if (new Date(bounty.deadline).getTime() < Date.now()) {
+        throw new Error('Cannot apply to a bounty with an expired deadline.')
+      }
+    }
+
     // Check for duplicate
     const existing = list.find(a => a.bounty_id === appData.bounty_id && a.developer_id === appData.developer_id && a.status !== 'withdrawn')
     if (existing) {
@@ -181,7 +198,7 @@ export class LocalStore {
 
     const newApp: Application = {
       ...appData,
-      id: 'app-' + Date.now(),
+      id: 'app-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
       status: 'pending',
       created_at: new Date().toISOString(),
       developer,
@@ -249,6 +266,39 @@ export class LocalStore {
     return app
   }
 
+  static selectDeveloper(bountyId: string, applicationId: string, developerId: string, callerId?: string): boolean {
+    const bounty = this.getBounty(bountyId)
+    if (!bounty) throw new Error('Bounty not found.')
+    if (callerId && bounty.creator_id !== callerId) {
+      throw new Error('Unauthorized: only the bounty creator can select a developer.')
+    }
+    if (bounty.status !== 'open') {
+      throw new Error(`Bounty is not open for selection (status: ${bounty.status}).`)
+    }
+
+    const apps = this.getApplications(bountyId)
+    const targetApp = apps.find(a => a.id === applicationId)
+    if (!targetApp) throw new Error('Application not found.')
+    if (targetApp.status !== 'pending') {
+      throw new Error(`Application is not pending (status: ${targetApp.status}).`)
+    }
+
+    // Accept selected application
+    this.updateApplicationStatus(applicationId, 'accepted')
+
+    // Reject all other pending applications for this bounty
+    apps.forEach(a => {
+      if (a.id !== applicationId && a.status === 'pending') {
+        this.updateApplicationStatus(a.id, 'rejected')
+      }
+    })
+
+    // Update bounty to in_progress with assigned developer
+    this.updateBountyStatus(bountyId, 'in_progress', developerId)
+
+    return true
+  }
+
   // Submissions (Workroom)
   static getSubmissions(bountyId: string): Submission[] {
     try {
@@ -269,9 +319,18 @@ export class LocalStore {
     const developer = profiles[subData.developer_id] || this.getCurrentUser() || DEMO_USER
     const bounty = this.getBounty(subData.bounty_id)
 
+    if (bounty) {
+      if (bounty.assigned_developer_id && bounty.assigned_developer_id !== subData.developer_id) {
+        throw new Error('Unauthorized: you are not the assigned developer for this bounty.')
+      }
+      if (bounty.status !== 'in_progress' && bounty.status !== 'in_review') {
+        throw new Error('Deliverables can only be submitted when bounty is in progress.')
+      }
+    }
+
     const newSub: Submission = {
       ...subData,
-      id: 'sub-' + Date.now(),
+      id: 'sub-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
       status: 'submitted',
       created_at: new Date().toISOString(),
       developer,
@@ -295,10 +354,17 @@ export class LocalStore {
     return newSub
   }
 
-  static updateSubmissionReview(submissionId: string, status: Submission['status'], feedback?: string): Submission | null {
+  static updateSubmissionReview(submissionId: string, status: Submission['status'], feedback?: string, reviewerId?: string): Submission | null {
     const list = this.getAllSubmissions()
     const index = list.findIndex(s => s.id === submissionId)
     if (index === -1) return null
+
+    const sub = list[index]
+    const bounty = this.getBounty(sub.bounty_id)
+
+    if (bounty && reviewerId && bounty.creator_id !== reviewerId) {
+      throw new Error('Unauthorized: only the creator can review submissions.')
+    }
 
     list[index].status = status
     if (feedback !== undefined) {
@@ -307,12 +373,22 @@ export class LocalStore {
     list[index].updated_at = new Date().toISOString()
     localStorage.setItem(STORAGE_KEYS.SUBMISSIONS, JSON.stringify(list))
 
-    const sub = list[index]
-    const bounty = this.getBounty(sub.bounty_id)
-
     if (bounty) {
       if (status === 'approved') {
         this.updateBountyStatus(bounty.id, 'completed')
+
+        // Update developer profile metrics
+        const devProfile = this.getProfile(sub.developer_id)
+        if (devProfile) {
+          const earned = (devProfile.total_earned_usd || 0) + (bounty.reward_amount || 0)
+          const completed = (devProfile.bounties_completed || 0) + 1
+          this.updateProfile({
+            id: sub.developer_id,
+            bounties_completed: completed,
+            total_earned_usd: earned
+          })
+        }
+
         this.createNotification({
           user_id: sub.developer_id,
           title: 'Work Approved & Escrow Released! 💰',
@@ -383,7 +459,7 @@ export class LocalStore {
 
     const newNotif: Notification = {
       ...notifData,
-      id: 'notif-' + Date.now(),
+      id: 'notif-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
       read: false,
       created_at: new Date().toISOString()
     }

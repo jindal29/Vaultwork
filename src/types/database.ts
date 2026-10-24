@@ -68,6 +68,20 @@ export interface Application {
   developer?: Profile
 }
 
+export type AssignmentStatus = 'active' | 'completed' | 'cancelled'
+
+export interface Assignment {
+  id: string
+  bounty_id: string
+  developer_id: string
+  status: AssignmentStatus
+  assigned_at: string
+  completed_at?: string | null
+  created_at: string
+  bounty?: Bounty
+  developer?: Profile
+}
+
 export type SubmissionStatus = 'submitted' | 'revision_requested' | 'approved'
 
 export interface Submission {
@@ -100,5 +114,24 @@ export interface Notification {
   type: NotificationType
   link: string
   read: boolean
+  created_at: string
+}
+
+export type ActivityEventType =
+  | 'bounty_created'
+  | 'application_submitted'
+  | 'developer_selected'
+  | 'work_submitted'
+  | 'revision_requested'
+  | 'work_approved'
+  | 'application_withdrawn'
+  | 'bounty_cancelled'
+
+export interface ActivityEvent {
+  id: string
+  bounty_id: string
+  actor_id: string
+  event_type: ActivityEventType
+  details: Record<string, unknown>
   created_at: string
 }
